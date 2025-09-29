@@ -18,6 +18,8 @@
 #include "swoole_memory.h"
 #include "swoole_lock.h"
 
+#include <sys/file.h>
+
 BEGIN_EXTERN_C()
 #include "stubs/php_swoole_lock_arginfo.h"
 END_EXTERN_C()
@@ -88,7 +90,7 @@ static const zend_function_entry swoole_lock_methods[] =
     PHP_ME(swoole_lock, __construct,  arginfo_class_Swoole_Lock___construct,  ZEND_ACC_PUBLIC)
     PHP_ME(swoole_lock, __destruct,   arginfo_class_Swoole_Lock___destruct,   ZEND_ACC_PUBLIC)
     PHP_ME(swoole_lock, lock,         arginfo_class_Swoole_Lock_lock,         ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_lock, lockwait,     arginfo_class_Swoole_Lock_locakwait,    ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_lock, lockwait,     arginfo_class_Swoole_Lock_lockwait,    ZEND_ACC_PUBLIC)
     PHP_ME(swoole_lock, trylock,      arginfo_class_Swoole_Lock_trylock,      ZEND_ACC_PUBLIC)
     PHP_ME(swoole_lock, lock_read,    arginfo_class_Swoole_Lock_lock_read,    ZEND_ACC_PUBLIC)
     PHP_ME(swoole_lock, trylock_read, arginfo_class_Swoole_Lock_trylock_read, ZEND_ACC_PUBLIC)
@@ -170,23 +172,50 @@ static PHP_METHOD(swoole_lock, lock) {
 
 static PHP_METHOD(swoole_lock, lockwait) {
     double timeout = 1.0;
+    // LOCK_EX: write lock(default)
+    // LOCK_SH: read lock(only for rwlock)
+    zend_long kind = LOCK_EX;
 
-    ZEND_PARSE_PARAMETERS_START(0, 1)
+    ZEND_PARSE_PARAMETERS_START(0, 2)
     Z_PARAM_OPTIONAL
     Z_PARAM_DOUBLE(timeout)
+    Z_PARAM_LONG(kind)
     ZEND_PARSE_PARAMETERS_END_EX(RETURN_FALSE);
 
     Lock *lock = php_swoole_lock_get_and_check_ptr(ZEND_THIS);
-    if (lock->get_type() != Lock::MUTEX) {
+    if (!(lock->get_type() == Lock::MUTEX
+#if defined(HAVE_RWLOCK_TIMEDRDLOCK) && defined(HAVE_RWLOCK_TIMEDWRLOCK)
+          || lock->get_type() == Lock::RW_LOCK
+#endif
+          )) {
+#if defined(HAVE_RWLOCK_TIMEDRDLOCK) && defined(HAVE_RWLOCK_TIMEDWRLOCK)
+        zend_throw_exception(swoole_exception_ce, "only mutex and rwlock supports lockwait", -2);
+#else
         zend_throw_exception(swoole_exception_ce, "only mutex supports lockwait", -2);
+#endif
+
         RETURN_FALSE;
     }
+    int timeout_msec = (int) (timeout * 1000);
+#if defined(HAVE_RWLOCK_TIMEDRDLOCK) && defined(HAVE_RWLOCK_TIMEDWRLOCK)
+    if (lock->get_type() == Lock::RW_LOCK) {
+        RWLock *rwlock = dynamic_cast<RWLock *>(lock);
+        if (rwlock == nullptr) {
+            zend_throw_exception(swoole_exception_ce, "wrong lock type", -3);
+            RETURN_FALSE;
+        }
+        if (kind == LOCK_SH) {
+            SW_LOCK_CHECK_RETURN(rwlock->lock_rd_wait(timeout_msec));
+        }
+        SW_LOCK_CHECK_RETURN(rwlock->lock_wait(timeout_msec));
+    }
+#endif
     Mutex *mutex = dynamic_cast<Mutex *>(lock);
     if (mutex == nullptr) {
         zend_throw_exception(swoole_exception_ce, "wrong lock type", -3);
         RETURN_FALSE;
     }
-    SW_LOCK_CHECK_RETURN(mutex->lock_wait((int) (timeout * 1000)));
+    SW_LOCK_CHECK_RETURN(mutex->lock_wait(timeout_msec));
 }
 
 static PHP_METHOD(swoole_lock, unlock) {
